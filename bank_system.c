@@ -20,6 +20,7 @@
 
 #define SALT_SIZE 16
 #define HASH_SIZE 32
+#define ADMIN_PIN "9999"
 
 // --- SHA-256 Implementation (public domain) ---
 typedef unsigned char BYTE;             // 8-bit byte
@@ -227,6 +228,19 @@ void hashPin(const char *pin, const unsigned char *salt, size_t salt_len, unsign
     sha256_final(&ctx, out_hash);
 }
 
+int adminAuthenticate() {
+    char input[32];
+    printf(GREEN "Enter admin PIN: " RESET);
+    getMaskedInput(input, sizeof(input));
+
+    if (strcmp(input, ADMIN_PIN) == 0) {
+        return 1;
+    } else {
+        printf(RED "Admin authentication failed.\n" RESET);
+        return 0;
+    }
+}
+
 int accountExists(int acc_no)
 {
     FILE *fp = fopen("accounts.dat", "rb");
@@ -301,6 +315,7 @@ int authenticate(int acc_no, const char *pin_input)
 
 void createAccount()
 {
+    if (!adminAuthenticate()) return;
     struct Account a;
     char pin_str[32];
     int ch;
@@ -513,6 +528,7 @@ void withdraw()
 
 void viewAccounts()
 {
+    if (!adminAuthenticate()) return;
     FILE *fp = fopen("accounts.dat", "rb");
     if (!fp)
     {
@@ -585,6 +601,7 @@ void searchAccount()
 
 void updateAccountName()
 {
+    if (!adminAuthenticate()) return;
     int acc_no;
     char pin_str[32];
     char newName[100];
@@ -657,6 +674,7 @@ void updateAccountName()
 
 void deleteAccount()
 {
+    if (!adminAuthenticate()) return;
     int acc_no;
     char pin_str[32];
     int found = 0;
