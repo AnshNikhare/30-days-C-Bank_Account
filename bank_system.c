@@ -10,6 +10,7 @@
 #else
 #include <termios.h>
 #include <unistd.h>
+#define CLEAR "clear"
 #endif
 
 #define RED     "\x1b[31m"
@@ -20,7 +21,7 @@
 
 #define SALT_SIZE 16
 #define HASH_SIZE 32
-#define ADMIN_PIN "9999"
+#define MAX_FAILED_ATTEMPTS 3
 
 // --- SHA-256 Implementation (public domain) ---
 typedef unsigned char BYTE;             // 8-bit byte
@@ -194,9 +195,12 @@ struct Account
     float balance;
     unsigned char pin_hash[HASH_SIZE];
     unsigned char salt[SALT_SIZE];
-    int failed_attempts; // present but unused in this instance
-    int locked; // present but unused in this instance
+    int failed_attempts;
+    int locked; // 0 = unlocked, 1 = locked
 };
+
+// Admin credentials file
+#define ADMIN_FILE "admin.dat"
 
 // Function prototypes
 void generateSalt(unsigned char *salt, size_t length);
@@ -210,9 +214,10 @@ void viewAccounts();
 void searchAccount();
 void updateAccountName();
 void deleteAccount();
-void printHex(const unsigned char *data, size_t len);
-void flush_stdin(void);
+void adminSetup();
+int adminAuthenticate();
 void getMaskedInput(char *buffer, size_t size);
+void printHex(const unsigned char *data, size_t len);
 
 void generateSalt(unsigned char *salt, size_t length) {
     for (size_t i = 0; i < length; i++) {
@@ -226,19 +231,6 @@ void hashPin(const char *pin, const unsigned char *salt, size_t salt_len, unsign
     sha256_update(&ctx, salt, salt_len);
     sha256_update(&ctx, (const BYTE *)pin, strlen(pin));
     sha256_final(&ctx, out_hash);
-}
-
-int adminAuthenticate() {
-    char input[32];
-    printf(GREEN "Enter admin PIN: " RESET);
-    getMaskedInput(input, sizeof(input));
-
-    if (strcmp(input, ADMIN_PIN) == 0) {
-        return 1;
-    } else {
-        printf(RED "Admin authentication failed.\n" RESET);
-        return 0;
-    }
 }
 
 int accountExists(int acc_no)
@@ -259,10 +251,6 @@ int accountExists(int acc_no)
     return 0;
 }
 
-/* Authentication for this instance:
- * - Hashes pin_input with the stored salt and compares with stored hash.
- * - No incrementing failed attempts, no lockout.
- */
 int authenticate(int acc_no, const char *pin_input)
 {
     FILE *fp = fopen("accounts.dat", "rb+");
@@ -279,45 +267,48 @@ int authenticate(int acc_no, const char *pin_input)
         {
             if (a.locked)
             {
-                printf(RED "This account is locked due to multiple failed attempts.\n" RESET);
-                fclose(fp);
-                return 0;
+                printf(RED "Account is locked due to multiple failed attempts.\n" RESET);
+                break;
             }
 
             hashPin(pin_input, a.salt, SALT_SIZE, input_hash);
 
             if (memcmp(input_hash, a.pin_hash, HASH_SIZE) == 0)
             {
+                // Reset failed attempts on success
                 a.failed_attempts = 0;
+                fseek(fp, -sizeof(struct Account), SEEK_CUR);
+                fwrite(&a, sizeof(struct Account), 1, fp);
                 result = 1;
+                break;
             }
             else
             {
+                // Increment failed attempts
                 a.failed_attempts++;
-                printf(RED "Incorrect PIN. Attempt %d/3\n" RESET, a.failed_attempts);
-                if (a.failed_attempts >= 3)
+                if (a.failed_attempts >= MAX_FAILED_ATTEMPTS)
                 {
                     a.locked = 1;
-                    printf(RED "Account locked due to 3 failed attempts.\n" RESET);
+                    printf(RED "Account locked due to %d failed attempts.\n" RESET, MAX_FAILED_ATTEMPTS);
                 }
+                else
+                {
+                    printf(RED "Incorrect PIN. Attempts left: %d\n" RESET, MAX_FAILED_ATTEMPTS - a.failed_attempts);
+                }
+                fseek(fp, -sizeof(struct Account), SEEK_CUR);
+                fwrite(&a, sizeof(struct Account), 1, fp);
+                break;
             }
-
-            // Write changes back
-            fseek(fp, -sizeof(struct Account), SEEK_CUR);
-            fwrite(&a, sizeof(struct Account), 1, fp);
-            break;
         }
     }
-
     fclose(fp);
     return result;
 }
 
 void createAccount()
 {
-    if (!adminAuthenticate()) return;
     struct Account a;
-    char pin_str[32];
+    char pin_str[10];
     int ch;
 
     printf(GREEN "Enter account number: " RESET);
@@ -392,7 +383,7 @@ void createAccount()
 void deposit()
 {
     int acc_no;
-    char pin_str[32];
+    char pin_str[10];
     float amount;
     int found = 0;
     int ch;
@@ -457,7 +448,7 @@ void deposit()
 void withdraw()
 {
     int acc_no;
-    char pin_str[32];
+    char pin_str[10];
     float amount;
     int found = 0;
     int ch;
@@ -528,7 +519,6 @@ void withdraw()
 
 void viewAccounts()
 {
-    if (!adminAuthenticate()) return;
     FILE *fp = fopen("accounts.dat", "rb");
     if (!fp)
     {
@@ -550,7 +540,7 @@ void viewAccounts()
 void searchAccount()
 {
     int acc_no;
-    char pin_str[32];
+    char pin_str[10];
     int ch;
 
     printf(GREEN "Enter account number to search: " RESET);
@@ -576,6 +566,11 @@ void searchAccount()
     {
         if (a.acc_no == acc_no)
         {
+            if (a.locked)
+            {
+                printf(RED "Account is locked due to multiple failed attempts.\n" RESET);
+                break;
+            }
             unsigned char input_hash[HASH_SIZE];
             hashPin(pin_str, a.salt, SALT_SIZE, input_hash);
             if (memcmp(input_hash, a.pin_hash, HASH_SIZE) == 0)
@@ -601,9 +596,8 @@ void searchAccount()
 
 void updateAccountName()
 {
-    if (!adminAuthenticate()) return;
     int acc_no;
-    char pin_str[32];
+    char pin_str[10];
     char newName[100];
     int found = 0;
     int ch;
@@ -619,6 +613,14 @@ void updateAccountName()
     printf(GREEN "Enter PIN for authentication: " RESET);
     while ((ch = getchar()) != '\n' && ch != EOF);
     getMaskedInput(pin_str, sizeof(pin_str));
+
+    // Admin authentication for critical action
+    printf(YELLOW "Admin authentication required.\n");
+    if (!adminAuthenticate())
+    {
+        printf(RED "Admin authentication failed.\n" RESET);
+        return;
+    }
 
     printf(GREEN "Enter new account holder name: " RESET);
     while ((ch = getchar()) != '\n' && ch != EOF);
@@ -674,9 +676,8 @@ void updateAccountName()
 
 void deleteAccount()
 {
-    if (!adminAuthenticate()) return;
     int acc_no;
-    char pin_str[32];
+    char pin_str[10];
     int found = 0;
     int ch;
 
@@ -691,6 +692,14 @@ void deleteAccount()
     printf(GREEN "Enter PIN for authentication: " RESET);
     while ((ch = getchar()) != '\n' && ch != EOF);
     getMaskedInput(pin_str, sizeof(pin_str));
+
+    // Admin authentication for critical action
+    printf(YELLOW "Admin authentication required.\n");
+    if (!adminAuthenticate())
+    {
+        printf(RED "Admin authentication failed.\n" RESET);
+        return;
+    }
 
     FILE *fp = fopen("accounts.dat", "rb");
     if (!fp)
@@ -708,80 +717,136 @@ void deleteAccount()
     struct Account a;
     while (fread(&a, sizeof(struct Account), 1, fp))
     {
-        if (a.acc_no == acc_no)
+        if (a.acc_no != acc_no)
+        {
+            fwrite(&a, sizeof(struct Account), 1, temp);
+        }
+        else
         {
             unsigned char input_hash[HASH_SIZE];
             hashPin(pin_str, a.salt, SALT_SIZE, input_hash);
             if (memcmp(input_hash, a.pin_hash, HASH_SIZE) == 0)
             {
                 found = 1;
-                /* skip writing this account => it will be deleted */
-                continue;
+                // Do not write this account to temp (delete)
             }
             else
             {
-                /* PIN incorrect: write the record back and stop deletion */
+                // Wrong PIN, keep account
                 fwrite(&a, sizeof(struct Account), 1, temp);
             }
-        }
-        else
-        {
-            fwrite(&a, sizeof(struct Account), 1, temp);
         }
     }
     fclose(fp);
     fclose(temp);
 
+    remove("accounts.dat");
+    rename("temp.dat", "accounts.dat");
+
     if (found)
     {
-        /* replace file */
-        remove("accounts.dat");
-        rename("temp.dat", "accounts.dat");
         printf(GREEN "Account %d deleted successfully.\n" RESET, acc_no);
     }
     else
     {
-        remove("temp.dat");
-        printf(RED "Account not found or PIN incorrect. No deletion performed.\n" RESET);
+        printf(RED "Account not found or PIN incorrect.\n" RESET);
     }
 }
 
-void printHex(const unsigned char *data, size_t len)
+// Admin PIN setup (run once)
+void adminSetup()
 {
-    for (size_t i = 0; i < len; ++i)
-        printf("%02x", data[i]);
-    printf("\n");
+    FILE *fp = fopen(ADMIN_FILE, "rb");
+    if (fp)
+    {
+        fclose(fp);
+        return; // Admin already setup
+    }
+
+    printf(YELLOW "No admin PIN found. Please set admin PIN (4 digits): " RESET);
+    char pin_str[10];
+    getMaskedInput(pin_str, sizeof(pin_str));
+    if (strlen(pin_str) != 4 || strspn(pin_str, "0123456789") != 4)
+    {
+        printf(RED "Invalid PIN. Must be exactly 4 digits.\n" RESET);
+        exit(1);
+    }
+
+    unsigned char salt[SALT_SIZE];
+    unsigned char pin_hash[HASH_SIZE];
+    generateSalt(salt, SALT_SIZE);
+    hashPin(pin_str, salt, SALT_SIZE, pin_hash);
+
+    fp = fopen(ADMIN_FILE, "wb");
+    if (!fp)
+    {
+        printf(RED "Error creating admin file.\n" RESET);
+        exit(1);
+    }
+    fwrite(salt, 1, SALT_SIZE, fp);
+    fwrite(pin_hash, 1, HASH_SIZE, fp);
+    fclose(fp);
+
+    printf(GREEN "Admin PIN set successfully.\n" RESET);
 }
 
-void flush_stdin(void)
+int adminAuthenticate()
 {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
+    FILE *fp = fopen(ADMIN_FILE, "rb");
+    if (!fp)
+    {
+        printf(RED "Admin PIN not set. Please restart and set admin PIN.\n" RESET);
+        exit(1);
+    }
+    unsigned char salt[SALT_SIZE];
+    unsigned char stored_hash[HASH_SIZE];
+    fread(salt, 1, SALT_SIZE, fp);
+    fread(stored_hash, 1, HASH_SIZE, fp);
+    fclose(fp);
+
+    printf(GREEN "Enter admin PIN: " RESET);
+    char pin_str[10];
+    getMaskedInput(pin_str, sizeof(pin_str));
+    if (strlen(pin_str) != 4 || strspn(pin_str, "0123456789") != 4)
+    {
+        printf(RED "Invalid PIN format.\n" RESET);
+        return 0;
+    }
+
+    unsigned char input_hash[HASH_SIZE];
+    hashPin(pin_str, salt, SALT_SIZE, input_hash);
+
+    if (memcmp(input_hash, stored_hash, HASH_SIZE) == 0)
+        return 1;
+
+    return 0;
 }
 
-/* Cross-platform masked PIN input:
- * - On Windows uses _getch()
- * - On Unix uses termios to disable echo
- * Accepts backspace. Stops on Enter. Writes null-terminated string.
- */
 void getMaskedInput(char *buffer, size_t size)
 {
-    if (size == 0) return;
-    size_t idx = 0;
 #ifdef _WIN32
-    int ch;
-    while ((ch = _getch()) != '\r' && ch != EOF) {
-        if (ch == '\b' || ch == 127) { // backspace
-            if (idx > 0) {
-                idx--;
+    size_t i = 0;
+    char ch;
+    while (i < size - 1)
+    {
+        ch = _getch();
+        if (ch == '\r' || ch == '\n')
+            break;
+        if (ch == '\b')
+        {
+            if (i > 0)
+            {
+                i--;
                 printf("\b \b");
             }
-        } else if (ch >= ' ' && ch <= '~' && idx + 1 < size) {
-            buffer[idx++] = (char)ch;
+        }
+        else if (isprint(ch))
+        {
+            buffer[i++] = ch;
             printf("*");
         }
     }
-    buffer[idx] = '\0';
+    buffer[i] = '\0';
     printf("\n");
 #else
     struct termios oldt, newt;
@@ -790,19 +855,17 @@ void getMaskedInput(char *buffer, size_t size)
     newt.c_lflag &= ~(ECHO);
     tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-    int ch;
-    while ((ch = getchar()) != '\n' && ch != EOF) {
-        if (ch == 127 || ch == '\b') { // backspace
-            if (idx > 0) {
-                idx--;
-                printf("\b \b");
-            }
-        } else if (ch >= ' ' && ch <= '~' && idx + 1 < size) {
-            buffer[idx++] = (char)ch;
-            printf("*");
-        }
+    if (fgets(buffer, size, stdin) == NULL)
+    {
+        buffer[0] = '\0';
     }
-    buffer[idx] = '\0';
+    else
+    {
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n')
+            buffer[len - 1] = '\0';
+    }
+
     tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     printf("\n");
 #endif
@@ -811,57 +874,68 @@ void getMaskedInput(char *buffer, size_t size)
 int main()
 {
     srand((unsigned int)time(NULL));
+    adminSetup();
 
-    while (1)
+    int choice;
+    do
     {
-        int choice;
-        printf("\n" BLUE "=== CLI Banking System (Instance 2 — Features 1+2) ===\n" RESET);
-        printf("1. Create Account\n");
-        printf("2. Deposit\n");
-        printf("3. Withdraw\n");
-        printf("4. View All Accounts\n");
-        printf("5. Search Account\n");
-        printf("6. Update Account Holder Name\n");
-        printf("7. Delete Account\n");
-        printf("8. Exit\n");
-        printf("Choose an option: ");
+        system(CLEAR);
+        printf(BLUE "\n=== Bank Account Management ===\n" RESET);
+        printf(YELLOW "1. Create Account\n" RESET);
+        printf(YELLOW "2. Deposit\n" RESET);
+        printf(YELLOW "3. Withdraw\n" RESET);
+        printf(YELLOW "4. View Accounts\n" RESET);
+        printf(YELLOW "5. Search Account\n" RESET);
+        printf(YELLOW "6. Update Account Holder Name\n" RESET);
+        printf(YELLOW "7. Delete Account\n" RESET);
+        printf(YELLOW "8. Exit\n" RESET);
+        printf(GREEN "Enter your choice: " RESET);
+
         if (scanf("%d", &choice) != 1)
         {
-            printf(RED "Invalid input.\n" RESET);
-            flush_stdin();
+            printf(RED "Invalid input!\n" RESET);
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF);
             continue;
         }
 
         switch (choice)
         {
-            case 1:
-                createAccount();
-                break;
-            case 2:
-                deposit();
-                break;
-            case 3:
-                withdraw();
-                break;
-            case 4:
-                viewAccounts();
-                break;
-            case 5:
-                searchAccount();
-                break;
-            case 6:
-                updateAccountName();
-                break;
-            case 7:
-                deleteAccount();
-                break;
-            case 8:
-                printf(YELLOW "Exiting.\n" RESET);
-                exit(0);
-            default:
-                printf(RED "Invalid choice.\n" RESET);
+        case 1:
+            createAccount();
+            break;
+        case 2:
+            deposit();
+            break;
+        case 3:
+            withdraw();
+            break;
+        case 4:
+            viewAccounts();
+            break;
+        case 5:
+            searchAccount();
+            break;
+        case 6:
+            updateAccountName();
+            break;
+        case 7:
+            deleteAccount();
+            break;
+        case 8:
+            printf(GREEN "Exiting...\n" RESET);
+            break;
+        default:
+            printf(RED "Invalid choice!\n" RESET);
         }
-    }
+        if (choice != 8)
+        {
+            printf(YELLOW "\nPress Enter to continue..." RESET);
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF);
+            getchar();
+        }
+    } while (choice != 8);
 
     return 0;
 }
