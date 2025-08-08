@@ -251,7 +251,7 @@ int accountExists(int acc_no)
  */
 int authenticate(int acc_no, const char *pin_input)
 {
-    FILE *fp = fopen("accounts.dat", "rb");
+    FILE *fp = fopen("accounts.dat", "rb+");
     if (!fp)
         return 0;
 
@@ -263,15 +263,38 @@ int authenticate(int acc_no, const char *pin_input)
     {
         if (a.acc_no == acc_no)
         {
+            if (a.locked)
+            {
+                printf(RED "This account is locked due to multiple failed attempts.\n" RESET);
+                fclose(fp);
+                return 0;
+            }
+
             hashPin(pin_input, a.salt, SALT_SIZE, input_hash);
 
             if (memcmp(input_hash, a.pin_hash, HASH_SIZE) == 0)
             {
+                a.failed_attempts = 0;
                 result = 1;
             }
+            else
+            {
+                a.failed_attempts++;
+                printf(RED "Incorrect PIN. Attempt %d/3\n" RESET, a.failed_attempts);
+                if (a.failed_attempts >= 3)
+                {
+                    a.locked = 1;
+                    printf(RED "Account locked due to 3 failed attempts.\n" RESET);
+                }
+            }
+
+            // Write changes back
+            fseek(fp, -sizeof(struct Account), SEEK_CUR);
+            fwrite(&a, sizeof(struct Account), 1, fp);
             break;
         }
     }
+
     fclose(fp);
     return result;
 }
